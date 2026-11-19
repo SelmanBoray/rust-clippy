@@ -21,7 +21,7 @@ use ui_test::spanned::Spanned;
 use ui_test::status_emitter::StatusEmitter;
 use ui_test::{Args, CommandBuilder, Config, Match, error_on_output_conflict};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env::{self, set_var, var_os};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -55,6 +55,8 @@ fn internal_extern_flags() -> Vec<String> {
     // Map `crate_name` -> (`hash`, [`path1`, `path2`, ...]). Important for `rlib`s, as cargo now
     // defaults to `-Zembed-metadata=no`, so the `rlib` only contains a metadata stub.
     let mut crates = BTreeMap::<&str, (&str, Vec<&str>)>::new();
+    // Directories of all libraries this test module depends on.
+    let mut lib_dirs = BTreeSet::<&Path>::new();
     for line in current_exe_depinfo.lines() {
         // each dependency is expected to have a Makefile rule like `/path/to/crate-hash.rlib:`
         let parse_name_path = || {
@@ -71,9 +73,11 @@ fn internal_extern_flags() -> Vec<String> {
             let name = name.strip_prefix("lib").unwrap_or(name);
             Some((name, hash, path_str))
         };
-        if let Some((name, hash, path)) = parse_name_path()
-            && INTERNAL_TEST_DEPENDENCIES.contains(&name)
-        {
+        let Some((name, hash, path)) = parse_name_path() else {
+            continue;
+        };
+        lib_dirs.extend(Path::new(path).parent());
+        if INTERNAL_TEST_DEPENDENCIES.contains(&name) {
             // A dependency may be listed twice (identified by the hash) if it is available in sysroot,
             // and the sysroot dependencies are listed first. So only keep the last dependency.
             let (old_hash, items) = crates.entry(name).or_insert((hash, Vec::new()));
@@ -110,17 +114,15 @@ fn internal_extern_flags() -> Vec<String> {
         // layout
         assert!(deps_path.ends_with("out"));
 
-        // Get a path to `target/<platform-profile>/build`
-        let build_dir = {
-            let mut d = deps_path.to_path_buf();
-            d.pop(); // remove `out`
-            d.pop(); // remove `<hash>`
-            d.pop(); // remove `<pkgname>`
-            d
-        };
-
-        let out_dirs = discover_out_dirs(&build_dir);
-        args.extend(out_dirs.iter().map(|path| format!("-Ldependency={}", path.display())));
+        // Only pass the directories of libraries this test module actually depends on. Passing every
+        // `out` dir of the build dir can exceed the command line length limit on Windows. Keeping only
+        // `out` dirs leaves out the sysroot.
+        args.extend(
+            lib_dirs
+                .into_iter()
+                .filter(|dir| dir.ends_with("out"))
+                .map(|dir| format!("-Ldependency={}", dir.display())),
+        );
     }
 
     args
